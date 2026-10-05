@@ -44,6 +44,8 @@ from ._payload_type import (
     encode_payload_type,
 )
 from ._register import (
+    ExtendedLengthRegister,
+    ExtendedMessageReceipt,
     RegisterBase,
     RegisterU8,
     RegisterU16,
@@ -113,6 +115,8 @@ __all__ = [
     "PayloadFloatArray",
     # Register DSL
     "RegisterBase",
+    "ExtendedLengthRegister",
+    "ExtendedMessageReceipt",
     # Register scalar types
     "RegisterU8",
     "RegisterU16",

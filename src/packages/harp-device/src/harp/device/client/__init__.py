@@ -1,6 +1,6 @@
 """Talking to a Harp device: the device itself, its transport and the framer."""
 
-from ._device import Device, DeviceError, EventHandler, Subscription
+from ._device import Device, DeviceError, EventHandler, Subscription, WriteVerificationError
 from ._framer import HarpFramer
 from ._transport import ITransport, TransportError
 
@@ -12,4 +12,5 @@ __all__ = [
     "HarpFramer",
     "ITransport",
     "TransportError",
+    "WriteVerificationError",
 ]

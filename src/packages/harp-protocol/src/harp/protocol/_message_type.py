@@ -1,5 +1,7 @@
 from enum import IntEnum
 
+from ._constants import _EXTENDED_LENGTH_FLAG
+
 
 class MessageType(IntEnum):
     """Represents the a message type from the harp protocol"""
@@ -9,8 +11,9 @@ class MessageType(IntEnum):
     Event = 3
 
 
-_RESERVED_MASK = 0b11110100
-"""Bits 7, 6, 5, 4 and 2 must be 0. Bit 3 is error and bits 1:0 are the type."""
+_RESERVED_MASK = 0b11100100
+"""Bits 7, 6, 5 and 2 must be 0. Bit 4 is extended length, bit 3 is error and bits 1:0
+are the type."""
 
 _VALID_TYPES = frozenset(t.value for t in MessageType)
 
@@ -26,7 +29,10 @@ def _message_type_from_byte_safe(b: int) -> "tuple[MessageType, bool] | None":
 
 
 def message_type_from_byte(b: int) -> tuple["MessageType", bool]:
-    """Decode a MessageType byte into ``(MessageType, has_error)``. Raises ``ValueError`` on invalid input."""
+    """Decode a MessageType byte into ``(MessageType, has_error)``. Raises ``ValueError`` on invalid input.
+
+    The framing the byte selects is read separately, with :func:`is_extended_length`.
+    """
     result = _message_type_from_byte_safe(b)
     if result is None:
         type_bits = b & 0x03
@@ -36,6 +42,17 @@ def message_type_from_byte(b: int) -> tuple["MessageType", bool]:
     return result
 
 
-def message_type_to_byte(message_type: MessageType, has_error: bool = False) -> int:
-    """Encode MessageType + error flag to a single byte."""
-    return message_type.value | (0x08 if has_error else 0)
+def message_type_to_byte(
+    message_type: MessageType, has_error: bool = False, *, extended_length: bool = False
+) -> int:
+    """Encode MessageType + error flag + extended-length flag to a single byte."""
+    return (
+        message_type.value
+        | (0x08 if has_error else 0)
+        | (_EXTENDED_LENGTH_FLAG if extended_length else 0)
+    )
+
+
+def is_extended_length(b: int) -> bool:
+    """Return True if a MessageType byte selects extended-length framing."""
+    return bool(b & _EXTENDED_LENGTH_FLAG)

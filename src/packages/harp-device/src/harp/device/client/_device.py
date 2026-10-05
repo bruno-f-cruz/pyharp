@@ -8,7 +8,17 @@ import queue
 import threading
 
 from harp.protocol import HarpMessage, MessageType
-from harp.protocol._register import RegisterBase
+from harp.protocol._constants import (
+    _CRC_LEN,
+    _EXTENDED_HEADER_LEN,
+    _MAX_FRAME_LEN,
+    _TIMESTAMP_LEN,
+)
+from harp.protocol._register import (
+    ExtendedLengthRegister,
+    ExtendedMessageReceipt,
+    RegisterBase,
+)
 
 from harp.device.schema import DeviceModuleLike
 from ._framer import HarpFramer
@@ -35,6 +45,14 @@ _Waiter = queue.SimpleQueue["HarpMessage | Exception"]
 """The received reply or failure that ends the wait of a blocked request."""
 
 
+def _max_frame_length(register: type[RegisterBase[Any]]) -> int:
+    """The largest frame, in bytes, that any message of ``register`` can take."""
+    if not register.is_extended_length:
+        return _MAX_FRAME_LEN
+    size = register.payload_class._max_payload_size()
+    return _EXTENDED_HEADER_LEN + _TIMESTAMP_LEN + size + _CRC_LEN
+
+
 def _normalize_message_types(message_types: MessageTypeFilter) -> frozenset[MessageType]:
     if isinstance(message_types, MessageType):
         return frozenset({message_types})
@@ -56,6 +74,27 @@ class DeviceError(Exception):
         )
         self.reply = reply
         """The error reply, as received."""
+
+
+class WriteVerificationError(Exception):
+    """Raised when the receipt for a write of an extended-length register does not match.
+
+    The device answers such a write with the CRC-32 it computed over the request it
+    received, so a mismatch means the frame did not arrive as sent. The receipt is
+    kept as :attr:`reply`, along with both CRC values.
+    """
+
+    def __init__(self, reply: "HarpMessage[ExtendedMessageReceipt]", expected: int) -> None:
+        super().__init__(
+            f"Write to register address {reply.address} (0x{reply.address:02x}) was "
+            f"received with CRC-32 0x{reply.payload.crc:08x}, but 0x{expected:08x} was sent."
+        )
+        self.reply = reply
+        """The receipt, as received."""
+        self.expected = expected
+        """The CRC-32 of the request that was sent."""
+        self.actual = reply.payload.crc
+        """The CRC-32 the device reported for the request it received."""
 
 
 class Subscription:
@@ -111,14 +150,32 @@ class Device(Generic[M]):
     :class:`~harp.device.client.TransportError`, and every later request reports the
     same failure rather than waiting for a reply that cannot arrive. A device that
     never answers raises :class:`TimeoutError` after ``REPLY_TIMEOUT``, which is also
-    what happens when :meth:`close` is called during a request.
+    what happens when :meth:`close` is called during a request. :meth:`read` and
+    :meth:`write` take a ``timeout`` to wait longer for a reply, which a slow write of
+    an extended-length register may need.
+
+    A write to an :class:`~harp.protocol.ExtendedLengthRegister` returns an
+    :class:`~harp.protocol.ExtendedMessageReceipt` rather than the written value, and
+    raises :class:`WriteVerificationError` when its CRC differs from that of the
+    request.
+
+    ``max_frame_length`` sets the largest frame, in bytes, the device is read with. It
+    defaults to the largest any register of ``device_module`` can send, and grows to
+    fit any register passed to :meth:`read`, :meth:`write` or :meth:`subscribe`. Raise
+    it to record extended-length frames of registers neither declares, for example
+    with :meth:`subscribe_all`.
     """
 
     REPLY_TIMEOUT: ClassVar[float] = 5.0  # seconds
 
     @overload
     def __init__(
-        self, transport: ITransport, device_module: M, *, raise_on_error: bool = ...
+        self,
+        transport: ITransport,
+        device_module: M,
+        *,
+        raise_on_error: bool = ...,
+        max_frame_length: int | None = ...,
     ) -> None: ...
 
     @overload
@@ -128,6 +185,7 @@ class Device(Generic[M]):
         device_module: None = ...,
         *,
         raise_on_error: bool = ...,
+        max_frame_length: int | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -136,13 +194,22 @@ class Device(Generic[M]):
         device_module: M | None = None,
         *,
         raise_on_error: bool = True,
+        max_frame_length: int | None = None,
     ) -> None:
         self._transport = transport
         self._device_module = device_module
         self.raise_on_error = raise_on_error
-        self._framer = HarpFramer()
+        if max_frame_length is None:
+            max_frame_length = _MAX_FRAME_LEN
+            if device_module is not None:
+                registers = device_module.REGISTER_MAP.values()
+                max_frame_length = max(map(_max_frame_length, registers), default=_MAX_FRAME_LEN)
+        self._framer = HarpFramer(max_frame_length)
         self._pending: dict[tuple[int, MessageType], list[_Waiter]] = {}
         self._pending_lock = threading.Lock()
+        # A frame is one transport write, and writes from concurrent requests must not
+        # interleave on the wire, or neither frame reaches the device intact.
+        self._write_lock = threading.Lock()
         self._fault: Exception | None = None
         self._running = False
         self._thread: threading.Thread | None = None
@@ -231,13 +298,27 @@ class Device(Generic[M]):
         *,
         timestamp: float | None = None,
         port: int = 255,
+        timeout: float | None = None,
     ) -> HarpMessage[P]:
         # Note: ty can't correctly infer the return type, and this is a known issue:
         # https://github.com/astral-sh/ty/issues/623
+        self._admit(register)
         frame = register.format(message_type=MessageType.Read, timestamp=timestamp, port=port)
-        msg = self._request(register.address, MessageType.Read, frame)
+        msg = self._request(register.address, MessageType.Read, frame, timeout)
         return msg.decode(register)
 
+    @overload
+    def write(
+        self,
+        register: type[ExtendedLengthRegister],
+        value: Any,
+        *,
+        timestamp: float | None = None,
+        port: int = 255,
+        timeout: float | None = None,
+    ) -> HarpMessage[ExtendedMessageReceipt]: ...
+
+    @overload
     def write(
         self,
         register: type[RegisterBase[P]],
@@ -245,12 +326,48 @@ class Device(Generic[M]):
         *,
         timestamp: float | None = None,
         port: int = 255,
-    ) -> HarpMessage[P]:
+        timeout: float | None = None,
+    ) -> HarpMessage[P]: ...
+
+    def write(
+        self,
+        register: Any,
+        value: Any,
+        *,
+        timestamp: float | None = None,
+        port: int = 255,
+        timeout: float | None = None,
+    ) -> HarpMessage[Any]:
+        """Write ``value`` to ``register`` and return the reply of the device.
+
+        The reply carries the written value, decoded by ``register``, except for an
+        :class:`~harp.protocol.ExtendedLengthRegister`. The device answers a write to one
+        with an :class:`~harp.protocol.ExtendedMessageReceipt` holding the CRC-32 of the
+        request it received, which is checked against the request sent before it is
+        returned.
+        """
+        self._admit(register)
         frame = register.format(
             value, message_type=MessageType.Write, timestamp=timestamp, port=port
         )
-        msg = self._request(register.address, MessageType.Write, frame)
-        return msg.decode(register)
+        msg = self._request(register.address, MessageType.Write, frame, timeout)
+        if not register.is_extended_length:
+            return msg.decode(register)
+        receipt = msg.decode(ExtendedMessageReceipt)
+        if msg.has_error:
+            # Returned only when raise_on_error is off. Its payload is defined as zero
+            # and carries no CRC to check.
+            return receipt
+        expected = int.from_bytes(frame[-_CRC_LEN:], "little")
+        if receipt.payload.crc != expected:
+            raise WriteVerificationError(receipt, expected)
+        return receipt
+
+    def _admit(self, register: type[RegisterBase[Any]]) -> None:
+        """Let the framer accept the largest frame ``register`` can send."""
+        needed = _max_frame_length(register)
+        if needed > self._framer.max_frame_length:
+            self._framer.max_frame_length = needed
 
     # ------------------------------------------------------------------
     # Events
@@ -269,7 +386,10 @@ class Device(Generic[M]):
         By default only unsolicited ``Event`` messages are delivered. Pass
         ``message_types`` (a :class:`MessageType` or an iterable of them) to also
         observe ``Read``/``Write`` replies, e.g.
-        ``message_types=(MessageType.Event, MessageType.Write)``.
+        ``message_types=(MessageType.Event, MessageType.Write)``. A ``Write`` reply of an
+        :class:`~harp.protocol.ExtendedLengthRegister` is delivered as the
+        :class:`~harp.protocol.ExtendedMessageReceipt` the device answers with, not as the
+        payload of the register.
 
         Handlers run on a single dedicated event thread, shared by *all*
         subscribers, so they may block or call back into :meth:`read`/:meth:`write`
@@ -282,6 +402,7 @@ class Device(Generic[M]):
         Returns a :class:`Subscription`; call :meth:`Subscription.unsubscribe` to
         stop.
         """
+        self._admit(register)
         sub = Subscription(self, register.address, handler, _normalize_message_types(message_types))
         with self._sub_lock:
             self._subscriptions.setdefault(register.address, []).append(sub)
@@ -336,8 +457,11 @@ class Device(Generic[M]):
 
         matching = [s for s in subs if msg.message_type in s._message_types]
         if matching and register is not None:
+            decoder: Any = register
+            if register.is_extended_length and msg.message_type is MessageType.Write:
+                decoder = ExtendedMessageReceipt
             try:
-                typed = msg.decode(register)
+                typed = msg.decode(decoder)
             except Exception:
                 _logger.exception(
                     "Failed to parse %r for address 0x%02x", msg.message_type, msg.address
@@ -399,7 +523,11 @@ class Device(Generic[M]):
 
         self._event_queue.put(msg)
 
-    def _request(self, address: int, message_type: MessageType, frame: bytes) -> HarpMessage:
+    def _request(
+        self, address: int, message_type: MessageType, frame: bytes, timeout: float | None
+    ) -> HarpMessage:
+        if timeout is None:
+            timeout = self.REPLY_TIMEOUT
         key = (address, message_type)
         q: _Waiter = queue.SimpleQueue()
         with self._pending_lock:
@@ -407,13 +535,13 @@ class Device(Generic[M]):
                 raise self._fault
             self._pending.setdefault(key, []).append(q)
         try:
-            self._transport.write(frame)
+            with self._write_lock:
+                self._transport.write(frame)
             try:
-                reply = q.get(timeout=self.REPLY_TIMEOUT)
+                reply = q.get(timeout=timeout)
             except queue.Empty as exc:
                 raise TimeoutError(
-                    f"No reply from device for register address {address} "
-                    f"within {self.REPLY_TIMEOUT}s"
+                    f"No reply from device for register address {address} within {timeout}s"
                 ) from exc
             if isinstance(reply, Exception):
                 raise reply

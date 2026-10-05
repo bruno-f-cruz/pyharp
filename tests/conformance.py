@@ -14,10 +14,14 @@ from harp.device.core import OperationControl, OperationControlPayload, WhoAmI
 from harp.device.schema import DeviceModule, DeviceModuleLike, create_device_module
 from harp.protocol import (
     ArrayConverter,
+    ExtendedLengthRegister,
+    ExtendedMessageReceipt,
     Field,
     HarpMessage,
     IdentityConverter,
     RegisterBase,
+    RegisterU8Array,
+    RegisterU16Array,
     StructPayload,
 )
 from harp.serial import open_device
@@ -156,3 +160,35 @@ def array_payload_members() -> None:
     payload = Payload(analog0=np.float32(0), accelerometer=np.zeros(3, dtype=np.float32))
     assert_type(payload.analog0, np.float32)
     assert_type(payload.accelerometer, NDArray[np.float32])
+
+
+class _Waveform(RegisterU16Array, ExtendedLengthRegister):
+    address = 0x64
+    length = 4096
+
+
+def extended_length_writes(device: Device, values: NDArray[np.uint16]) -> None:
+    """A write to a register marked extended-length returns the receipt of the device,
+    while a read of it still returns its payload."""
+    assert_type(device.write(_Waveform, values), HarpMessage[ExtendedMessageReceipt])
+    assert_type(device.write(_Waveform, values).payload.crc, int)
+    assert_type(device.read(_Waveform), HarpMessage[NDArray[np.uint16]])
+
+
+class _Tag(RegisterU8Array):
+    address = 0x11
+    max_length = 64
+
+
+def variable_length_registers(device: Device, tag: NDArray[np.uint8]) -> None:
+    """A variable-length register reads and writes the same array type as a fixed one."""
+    assert_type(device.read(_Tag), HarpMessage[NDArray[np.uint8]])
+    assert_type(device.write(_Tag, tag), HarpMessage[NDArray[np.uint8]])
+    assert_type(RegisterU8Array(0x11, max_length=64), type[RegisterU8Array])
+
+
+def register_framing_properties() -> None:
+    """Framing and sizing are readable on any register class at runtime."""
+    assert_type(_Tag.is_variable_length, bool)
+    assert_type(_Tag.is_extended_length, bool)
+    assert_type(_Waveform.is_extended_length, bool)

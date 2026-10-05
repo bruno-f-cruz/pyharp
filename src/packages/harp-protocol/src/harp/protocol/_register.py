@@ -1,4 +1,6 @@
+import zlib
 from abc import ABC, ABCMeta
+from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, TypeVar, cast, final, overload
 
 import numpy as np
@@ -7,11 +9,17 @@ from typing_extensions import Sentinel
 
 from ._builder import build_message_frame
 from ._constants import (
+    _CHECKSUM_LEN,
+    _CRC_LEN,
     _DEFAULT_PORT,
+    _EXTENDED_HEADER_LEN,
+    _EXTENDED_LENGTH_FLAG,
     _HEADER_LEN,
+    _MAX_REGULAR_PAYLOAD_LEN,
     _MIN_FRAME_LEN,
     _TICK_PERIOD_S,
     _TIMESTAMP_FLAG,
+    _TIMESTAMP_LEN,
     _TIMESTAMPED_PAYLOAD_OFFSET,
     _TS_MICROS_OFFSET,
 )
@@ -114,6 +122,38 @@ class _RegisterBaseMeta(ABCMeta):
         address = getattr(cls, "address", None)
         return super().__repr__() if address is None else f"<{cls.__name__} @{address}>"
 
+    @property
+    def is_extended_length(cls) -> bool:
+        """Whether every message of this register uses extended-length framing.
+
+        Derived from the payload size: a register whose payload does not fit in a
+        regular frame together with a timestamp uses extended-length framing, a U32
+        length and a CRC-32, for every message to and from it. That holds for a message
+        without a timestamp too, and for a ``Read`` request with no payload at all, so
+        the framing is a property of the register rather than of any one message.
+        """
+        # Cached on the class itself, not inherited, since a subclass may resize the
+        # payload; formatting reads it for every frame.
+        cached = cls.__dict__.get("_extended_length")
+        if cached is None:
+            payload_class = getattr(cls, "payload_class", None)
+            cached = (
+                payload_class is not None
+                and payload_class._max_payload_size() > _MAX_REGULAR_PAYLOAD_LEN
+            )
+            setattr(cls, "_extended_length", cached)
+        return cached
+
+    @property
+    def is_variable_length(cls) -> bool:
+        """Whether a message of this register may carry any number of elements.
+
+        True for an array register declared with ``max_length``, whose messages carry
+        from none up to that many elements, and False for every register of fixed size.
+        """
+        payload_class = getattr(cls, "payload_class", None)
+        return payload_class is not None and payload_class._max_length is not None
+
 
 def _require_no_address(cls: Any) -> None:
     address = getattr(cls, "address", None)
@@ -166,7 +206,17 @@ class RegisterBase(ABC, Generic[U], metaclass=_RegisterBaseMeta):
         registers) return the raw numpy scalar or ndarray directly.
         """
         buf = value.payload_bytes if isinstance(value, HarpMessage) else value
-        expected = cls.payload_class.payload_dtype.itemsize
+        payload_class = cls.payload_class
+        if payload_class._max_length is not None:
+            # A variable-length array: every whole element present, up to the maximum.
+            if not payload_class._accepts_payload_size(len(buf)):
+                raise HarpParseError(
+                    f"{cls.__name__} reads up to {payload_class._max_length} elements of "
+                    f"{cls.payload_type!r} but {len(buf)} payload bytes are not that."
+                )
+            elements = np.frombuffer(buf, dtype=payload_class.payload_dtype)
+            return cast(U, payload_class._unwrap(elements))
+        expected = payload_class.payload_dtype.itemsize
         if len(buf) < expected:
             raise HarpParseError(
                 f"{cls.__name__} reads {expected} payload bytes as {cls.payload_type!r} "
@@ -186,6 +236,18 @@ class RegisterBase(ABC, Generic[U], metaclass=_RegisterBaseMeta):
         # Returns (data, timestamps, msgtype_view, payload). ``data`` is
         payload_cls = cls.payload_class
         data = np.frombuffer(source, dtype=np.uint8)
+
+        if payload_cls._max_length is not None:
+            raise NotImplementedError(
+                f"{cls.__name__}: bulk parsing of variable-length frames is not supported yet."
+            )
+        if cls.is_extended_length or (len(data) > 0 and int(data[0]) & _EXTENDED_LENGTH_FLAG):
+            # A recording of such a register mixes frames of different sizes, since a
+            # write is answered with a regular frame carrying only a CRC, so no single
+            # stride describes it.
+            raise NotImplementedError(
+                f"{cls.__name__}: bulk parsing of extended-length frames is not supported yet."
+            )
 
         if len(data) == 0:
             # No frames, but still need to return a Batch with the right dtype.
@@ -253,6 +315,10 @@ class RegisterBase(ABC, Generic[U], metaclass=_RegisterBaseMeta):
         ``parse_bulk``.
         """
         payload_cls = cls.payload_class
+        if payload_cls._max_length is not None:
+            raise NotImplementedError(
+                f"{cls.__name__}: bulk formatting of variable-length frames is not supported yet."
+            )
         record_dtype = payload_cls.payload_dtype
         itemsize = record_dtype.itemsize
         subdtype = record_dtype.subdtype
@@ -291,30 +357,47 @@ class RegisterBase(ABC, Generic[U], metaclass=_RegisterBaseMeta):
             )
 
         is_timestamped = timestamps is not None
-        payload_offset = _TIMESTAMPED_PAYLOAD_OFFSET if is_timestamped else _HEADER_LEN
-        stride = payload_offset + itemsize + 1  # trailing checksum byte
+        extended = cls.is_extended_length
+        header_len = _EXTENDED_HEADER_LEN if extended else _HEADER_LEN
+        checksum_len = _CRC_LEN if extended else _CHECKSUM_LEN
+        payload_offset = header_len + _TIMESTAMP_LEN if is_timestamped else header_len
+        ts_micros_offset = header_len + 4
+        stride = payload_offset + itemsize + checksum_len
 
         buf = np.zeros((nrows, stride), dtype=np.uint8)
-        buf[:, 0] = _encode_message_types(message_type, nrows)
-        buf[:, 1] = stride - 2
-        buf[:, 2] = cls.address
-        buf[:, 3] = port
-        buf[:, 4] = encode_payload_type(cls.payload_type, has_timestamp=is_timestamped)
+        # The framing is the register's, whatever flags the given message types carry.
+        msg_types = _encode_message_types(message_type, nrows)
+        if extended:
+            buf[:, 0] = msg_types | _EXTENDED_LENGTH_FLAG
+            length = np.array([stride - (header_len - 3)], dtype="<u4")
+            buf[:, 1 : header_len - 3] = length.view(np.uint8)
+        else:
+            buf[:, 0] = msg_types & np.uint8(~_EXTENDED_LENGTH_FLAG & 0xFF)
+            buf[:, 1] = stride - 2
+        buf[:, header_len - 3] = cls.address
+        buf[:, header_len - 2] = port
+        buf[:, header_len - 1] = encode_payload_type(cls.payload_type, has_timestamp=is_timestamped)
 
         if is_timestamped:
             ts = np.atleast_1d(np.asarray(timestamps, dtype=np.float64))
             seconds = ts.astype(np.uint32)
             micros = np.round((ts - seconds.astype(np.float64)) / _TICK_PERIOD_S).astype(np.uint16)
-            buf[:, _HEADER_LEN:_TS_MICROS_OFFSET] = np.frombuffer(
+            buf[:, header_len:ts_micros_offset] = np.frombuffer(
                 seconds.astype("<u4").tobytes(), dtype=np.uint8
             ).reshape(nrows, 4)
-            buf[:, _TS_MICROS_OFFSET:_TIMESTAMPED_PAYLOAD_OFFSET] = np.frombuffer(
+            buf[:, ts_micros_offset:payload_offset] = np.frombuffer(
                 micros.astype("<u2").tobytes(), dtype=np.uint8
             ).reshape(nrows, 2)
 
         payload_bytes = np.frombuffer(flat, dtype=np.uint8).reshape(nrows, itemsize)
         buf[:, payload_offset : payload_offset + itemsize] = payload_bytes
-        buf[:, -1] = buf[:, :-1].sum(axis=1, dtype=np.uint64).astype(np.uint8)
+        if extended:
+            crcs = np.fromiter(
+                (zlib.crc32(row) for row in buf[:, :-_CRC_LEN]), dtype="<u4", count=nrows
+            )
+            buf[:, -_CRC_LEN:] = crcs.view(np.uint8).reshape(nrows, _CRC_LEN)
+        else:
+            buf[:, -1] = buf[:, :-1].sum(axis=1, dtype=np.uint64).astype(np.uint8)
         return buf.reshape(-1)
 
     @overload
@@ -353,12 +436,20 @@ class RegisterBase(ABC, Generic[U], metaclass=_RegisterBaseMeta):
         if value is _MISSING:
             mt = MessageType.Read if message_type is None else message_type
             return build_message_frame(
-                mt, cls.address, cls.payload_type, port=port, timestamp=timestamp
+                mt,
+                cls.address,
+                cls.payload_type,
+                port=port,
+                timestamp=timestamp,
+                extended_length=cls.is_extended_length,
             )
         else:
             mt = MessageType.Write if message_type is None else message_type
             if isinstance(value, PayloadBase):
                 raw = value.payload_array.tobytes()
+            elif cls.payload_class._max_length is not None:
+                # The payload class checks the element count and converts the elements.
+                raw = cls.payload_class(value).payload_array.tobytes()
             elif isinstance(value, np.ndarray):
                 raw = value.tobytes()
             else:
@@ -367,8 +458,60 @@ class RegisterBase(ABC, Generic[U], metaclass=_RegisterBaseMeta):
                 # converter (e.g. a str via StringConverter) is applied.
                 raw = cls.payload_class(value).payload_array.tobytes()
             return build_message_frame(
-                mt, cls.address, cls.payload_type, raw, port=port, timestamp=timestamp
+                mt,
+                cls.address,
+                cls.payload_type,
+                raw,
+                port=port,
+                timestamp=timestamp,
+                extended_length=cls.is_extended_length,
             )
+
+
+class ExtendedLengthRegister:
+    """Marks a register as extended-length for type checkers.
+
+    A device answers a write to an extended-length register with an
+    :class:`ExtendedMessageReceipt` rather than the written value, which
+    :meth:`~harp.device.client.Device.write` can only express in its return type when
+    the register is marked::
+
+        class Waveform(RegisterU16Array, ExtendedLengthRegister):
+            address = 0x64
+            length = 4096
+
+    The marker has no effect at runtime. Framing is always derived from the payload
+    size (see ``is_extended_length``), so an unmarked large register is still framed and
+    answered correctly, only typed as returning its own payload.
+
+    Extended-length framing is proposed in harp-tech/protocol#218 and is not yet part
+    of the protocol specification, so this API may change.
+    """
+
+
+@dataclass(frozen=True)
+class ExtendedMessageReceipt:
+    """The payload of the device's answer to a write of an extended-length register.
+
+    A device does not echo the written value back, which may be megabytes long, but
+    the CRC-32 it computed over the request it received, as proposed in
+    harp-tech/protocol#221. A receipt matching the CRC of the request sent is
+    evidence the device received the frame intact.
+
+    ``ExtendedMessageReceipt`` also decodes such a message itself, as
+    ``message.decode(ExtendedMessageReceipt)``.
+    """
+
+    payload_type: ClassVar[PayloadType] = PayloadType.U32
+    payload_class: ClassVar[type[PayloadBase[Any]]] = PayloadU32
+
+    crc: int
+    """The CRC-32 the device computed over the request it received."""
+
+    @classmethod
+    def parse(cls, value: HarpMessage | bytes | bytearray | memoryview) -> "ExtendedMessageReceipt":
+        """Read a receipt out of a message or its payload bytes."""
+        return cls(int(RegisterU32.parse(value)))
 
 
 class RegisterU8(RegisterBase[np.uint8], metaclass=_ScalarRegisterMeta):
@@ -435,14 +578,23 @@ class RegisterFloat(RegisterBase[np.float32], metaclass=_ScalarRegisterMeta):
 
 
 class _ArrayRegisterMeta(_RegisterBaseMeta):
-    """A declared ``length`` sizes the payload, and calling a register base with an address
-    and a length creates a one-off subclass: ``RegisterU16Array(0x28, length=3)``.
+    """A declared ``length`` or ``max_length`` sizes the payload, and calling a register
+    base with an address and either creates a one-off subclass:
+    ``RegisterU16Array(0x28, length=3)`` or ``RegisterU8Array(0x11, max_length=64)``.
 
-    ``length`` is declared here rather than on ``RegisterBase``, so only an array register
-    carries one. It is the element count, and nothing reads it to size a payload.
+    ``length`` fixes the element count of every message. ``max_length`` makes the
+    register variable-length instead: a message carries any number of elements from
+    none up to ``max_length``, and ``parse`` returns an array of as many as arrived.
+    Framing is derived from the maximum, so a variable-length register whose maximum
+    does not fit in a regular frame uses extended-length framing for every message.
+
+    Both are declared here rather than on ``RegisterBase``, so only an array register
+    carries them, and a register declares exactly one. They are element counts, and
+    nothing reads them to size a payload.
     """
 
     length: int
+    max_length: int
     payload_class: type[AnonymousPayload[Any]]
 
     def __init__(
@@ -452,84 +604,125 @@ class _ArrayRegisterMeta(_RegisterBaseMeta):
         # The namespace holds this class body only, not inherited values, so a plain
         # subclass reads None and keeps the payload already sized by its base.
         length = namespace.get("length")
-        if length is None:
+        max_length = namespace.get("max_length")
+        if length is None and max_length is None:
             return
+        if length is not None and max_length is not None:
+            raise TypeError(f"{name} declares both length and max_length; declare one.")
         base_payload = cls.payload_class
-        if base_payload.payload_dtype.subdtype is not None:
+        if base_payload.payload_dtype.subdtype is not None or base_payload._max_length is not None:
             raise TypeError(f"{name} redeclares a length already applied by its base class.")
-        # A sub-array dtype, so reading one buffer element gives an ndarray of that shape.
+        if length is not None:
+            # A sub-array dtype, so reading one buffer element gives an ndarray of that shape.
+            cls.payload_class = type(
+                f"{base_payload.__name__}_{length}",
+                (base_payload,),
+                {"payload_dtype": np.dtype((base_payload.payload_dtype, (length,)))},
+            )
+            return
+        assert max_length is not None  # declaring neither returned above
+        if max_length < 1:
+            raise ValueError(f"{name} declares max_length={max_length}; it must be at least 1.")
+        # The dtype stays a single element, read as many times as the payload holds.
         cls.payload_class = type(
-            f"{base_payload.__name__}_{length}",
+            f"{base_payload.__name__}_max{max_length}",
             (base_payload,),
-            {"payload_dtype": np.dtype((base_payload.payload_dtype, (length,)))},
+            {"payload_dtype": base_payload.payload_dtype, "_max_length": max_length},
         )
 
-    def __call__(cls: "type[_AR]", address: int, *, length: int) -> "type[_AR]":  # type: ignore[override, misc]
+    # The overloads let a type checker require exactly one of the two sizes, which the
+    # implementation checks again at runtime for untyped callers.
+    @overload
+    def __call__(  # type: ignore[override, misc]
+        cls: "type[_AR]",  # type: ignore[misc]
+        address: int,
+        *,
+        length: int,
+    ) -> "type[_AR]": ...
+
+    @overload
+    def __call__(  # type: ignore[override, misc]
+        cls: "type[_AR]",  # type: ignore[misc]
+        address: int,
+        *,
+        max_length: int,
+    ) -> "type[_AR]": ...
+
+    def __call__(  # type: ignore[override, misc]
+        cls: "type[_AR]",  # type: ignore[misc]
+        address: int,
+        *,
+        length: int | None = None,
+        max_length: int | None = None,
+    ) -> "type[_AR]":
         _require_no_address(cls)
+        if (length is None) == (max_length is None):
+            raise TypeError(f"{cls.__name__}() takes exactly one of length= or max_length=.")
+        sizing = {"length": length} if length is not None else {"max_length": max_length}
         return cast(
             "type[_AR]",
-            type(f"{cls.__name__}_{address:#04x}", (cls,), {"address": address, "length": length}),
+            type(f"{cls.__name__}_{address:#04x}", (cls,), {"address": address, **sizing}),
         )
 
 
 class RegisterU8Array(RegisterBase[NDArray[np.uint8]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with a uint8 array payload. It must be instantiated with a length: ``RegisterU8Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint8]``."""
+    """A simple array register with a uint8 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterU8Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint8]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.U8
     payload_class = PayloadU8Array
 
 
 class RegisterU16Array(RegisterBase[NDArray[np.uint16]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with a uint16 array payload. It must be instantiated with a length: ``RegisterU16Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint16]``."""
+    """A simple array register with a uint16 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterU16Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint16]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.U16
     payload_class = PayloadU16Array
 
 
 class RegisterU32Array(RegisterBase[NDArray[np.uint32]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with a uint32 array payload. It must be instantiated with a length: ``RegisterU32Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint32]``."""
+    """A simple array register with a uint32 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterU32Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint32]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.U32
     payload_class = PayloadU32Array
 
 
 class RegisterU64Array(RegisterBase[NDArray[np.uint64]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with a uint64 array payload. It must be instantiated with a length: ``RegisterU64Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint64]``."""
+    """A simple array register with a uint64 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterU64Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.uint64]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.U64
     payload_class = PayloadU64Array
 
 
 class RegisterS8Array(RegisterBase[NDArray[np.int8]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with an int8 array payload. It must be instantiated with a length: ``RegisterS8Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int8]``."""
+    """A simple array register with an int8 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterS8Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int8]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.S8
     payload_class = PayloadS8Array
 
 
 class RegisterS16Array(RegisterBase[NDArray[np.int16]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with an int16 array payload. It must be instantiated with a length: ``RegisterS16Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int16]``."""
+    """A simple array register with an int16 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterS16Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int16]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.S16
     payload_class = PayloadS16Array
 
 
 class RegisterS32Array(RegisterBase[NDArray[np.int32]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with an int32 array payload. It must be instantiated with a length: ``RegisterS32Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int32]``."""
+    """A simple array register with an int32 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterS32Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int32]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.S32
     payload_class = PayloadS32Array
 
 
 class RegisterS64Array(RegisterBase[NDArray[np.int64]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with an int64 array payload. It must be instantiated with a length: ``RegisterS64Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int64]``."""
+    """A simple array register with an int64 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterS64Array(0x28, length=3)``. ``parse()`` returns ``NDArray[np.int64]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.S64
     payload_class = PayloadS64Array
 
 
 class RegisterFloatArray(RegisterBase[NDArray[np.float32]], metaclass=_ArrayRegisterMeta):
-    """A simple array register with a float32 array payload. It must be instantiated with a length: ``RegisterFloatArray(0x28, length=3)``. ``parse()`` returns ``NDArray[np.float32]``."""
+    """A simple array register with a float32 array payload. It must be sized with a fixed ``length`` or a variable ``max_length``: ``RegisterFloatArray(0x28, length=3)``. ``parse()`` returns ``NDArray[np.float32]``."""
 
     payload_type: ClassVar[PayloadType] = PayloadType.Float
     payload_class = PayloadFloatArray

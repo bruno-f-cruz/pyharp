@@ -1,3 +1,6 @@
+import struct
+import zlib
+
 TIMESTAMP_1S: bytes = b"\x01\x00\x00\x00\x00\x00"
 
 
@@ -17,3 +20,24 @@ def make_frame_from_raw(
     frame = bytes([msg_type_byte, length]) + body
     checksum = sum(frame) & 0xFF
     return frame + bytes([checksum])
+
+
+def make_extended_frame_from_raw(
+    msg_type_byte: int,
+    address: int,
+    port: int,
+    payload_type: int,
+    payload: bytes,
+    *,
+    timestamp: bytes | None = None,
+) -> bytes:
+    """Build an extended-length frame by hand, independently of the library builder.
+
+    ``msg_type_byte`` is used as given, so the caller sets the extended-length bit.
+    """
+    ts = timestamp if timestamp is not None else b""
+    pt_byte = payload_type | (0x10 if ts else 0)
+    body = bytes([address, port, pt_byte]) + ts + payload
+    length = len(body) + 4  # +4 for the CRC-32
+    frame = bytes([msg_type_byte]) + struct.pack("<I", length) + body
+    return frame + struct.pack("<I", zlib.crc32(frame))

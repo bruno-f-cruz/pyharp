@@ -4,6 +4,7 @@
 
 ::: harp.device.client.Device
 ::: harp.device.client.DeviceError
+::: harp.device.client.WriteVerificationError
 ::: harp.device.client.Subscription
 ::: harp.device.client.EventHandler
 ::: harp.device.client.HarpFramer

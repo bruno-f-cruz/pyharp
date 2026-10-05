@@ -680,6 +680,9 @@ class PayloadBase(Generic[NpStructT]):
     _elem_dtype: ClassVar[np.dtype] = _DEFAULT_ELEMENT
     # The ``__value__`` field of an AnonymousPayload root, else None: ``parse`` unwraps to it.
     _single_member: ClassVar[str | None] = None
+    # The largest element count of a variable-length payload, whose ``payload_dtype`` is
+    # then a single element rather than the whole record. None for a fixed payload.
+    _max_length: ClassVar[int | None] = None
     # The underlying numpy array holding one (0-D) or many (1-D) payload records.
     _arr: NDArray[NpStructT]
 
@@ -824,6 +827,25 @@ class PayloadBase(Generic[NpStructT]):
             )
 
         cls._defaults = cls._collect_defaults()
+
+    @classmethod
+    def _max_payload_size(cls) -> int:
+        """The largest payload, in bytes, a message of this payload can carry."""
+        if cls._max_length is None:
+            return cls.payload_dtype.itemsize
+        return cls._max_length * cls.payload_dtype.itemsize
+
+    @classmethod
+    def _accepts_payload_size(cls, nbytes: int) -> bool:
+        """Whether ``nbytes`` payload bytes can be read as this payload.
+
+        Exactly the record size for a fixed payload. For a variable-length one, any
+        whole number of elements up to its maximum, none included.
+        """
+        itemsize = cls.payload_dtype.itemsize
+        if cls._max_length is None:
+            return nbytes == itemsize
+        return nbytes % itemsize == 0 and nbytes // itemsize <= cls._max_length
 
     @classmethod
     def _from_array(cls, arr: "np.ndarray") -> Self:
@@ -1041,6 +1063,12 @@ class AnonymousPayload(PayloadBase[NpStructT]):
                 )
         else:
             arr = np.asarray(value, dtype=self.payload_dtype)
+            max_length = self._max_length
+            if max_length is not None and (arr.ndim != 1 or len(arr) > max_length):
+                raise ValueError(
+                    f"{type(self).__name__}() expects a 1-D array of up to {max_length} "
+                    f"elements but got shape {arr.shape}"
+                )
         self._arr = arr
 
     @classmethod

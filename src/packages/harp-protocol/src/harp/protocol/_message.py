@@ -7,14 +7,19 @@ from typing_extensions import Sentinel
 
 from ._builder import build_message_frame
 from ._checksum import validate as _validate_checksum
+from ._checksum import validate_crc32 as _validate_crc32
 from ._constants import (
+    _CHECKSUM_LEN,
+    _CRC_LEN,
     _DEFAULT_PORT,
+    _EXTENDED_HEADER_LEN,
+    _EXTENDED_LENGTH_FLAG,
     _HEADER_LEN,
+    _MIN_EXTENDED_FRAME_LEN,
     _MIN_FRAME_LEN,
     _TICK_PERIOD_S,
     _TIMESTAMP_FLAG,
     _TIMESTAMP_LEN,
-    _TIMESTAMPED_PAYLOAD_OFFSET,
 )
 from ._message_type import MessageType, _message_type_from_byte_safe
 from ._payload import PayloadBase
@@ -32,6 +37,56 @@ class HarpParseError(Exception):
     """An exception raised for errors encountered during message parsing"""
 
     pass
+
+
+_ADDRESS = _HEADER_LEN - 3
+"""Byte offset of the address in a regular frame, after the type and the U8 length."""
+
+_EXT_ADDRESS = _EXTENDED_HEADER_LEN - 3
+"""Byte offset of the address in an extended-length frame, after the type and the U32
+length."""
+
+
+def _validate_regular_frame(raw: bytes) -> None:
+    """Check the U8 length and U8 sum of a regular frame and its payload type byte."""
+    if len(raw) < _MIN_FRAME_LEN:
+        raise HarpParseError(f"Frame too short: {len(raw)} bytes (minimum {_MIN_FRAME_LEN})")
+
+    if not _validate_checksum(raw):
+        raise HarpParseError("Checksum mismatch")
+
+    length = raw[1]
+    if len(raw) != length + 2:
+        raise HarpParseError(f"Length field {length} inconsistent with buffer size {len(raw)}")
+
+    _validate_payload_type(raw[4], len(raw), _MIN_FRAME_LEN)
+
+
+def _validate_extended_frame(raw: bytes) -> None:
+    """Check the U32 length and CRC-32 of an extended-length frame and its payload type."""
+    if len(raw) < _MIN_EXTENDED_FRAME_LEN:
+        raise HarpParseError(
+            f"Frame too short: {len(raw)} bytes (minimum {_MIN_EXTENDED_FRAME_LEN})"
+        )
+
+    if not _validate_crc32(raw):
+        raise HarpParseError("CRC-32 checksum mismatch")
+
+    length = int.from_bytes(raw[1:5], "little")
+    if len(raw) != length + 5:
+        raise HarpParseError(f"Length field {length} inconsistent with buffer size {len(raw)}")
+
+    _validate_payload_type(raw[_EXTENDED_HEADER_LEN - 1], len(raw), _MIN_EXTENDED_FRAME_LEN)
+
+
+def _validate_payload_type(pt_byte: int, frame_len: int, min_len: int) -> None:
+    try:
+        decode_payload_type(pt_byte)
+    except ValueError as exc:
+        raise HarpParseError(str(exc)) from exc
+
+    if pt_byte & _TIMESTAMP_FLAG and frame_len < min_len + _TIMESTAMP_LEN:
+        raise HarpParseError("Frame too short to contain timestamp")
 
 
 class PayloadDecoder(Protocol[_P_co]):
@@ -71,9 +126,16 @@ class HarpMessage(Generic[P]):
         *,
         port: int = _DEFAULT_PORT,
         timestamp: float | None = None,
+        extended_length: bool | None = None,
     ) -> None:
         self._bytes: bytes = build_message_frame(
-            message_type, address, payload_type, payload_bytes, port=port, timestamp=timestamp
+            message_type,
+            address,
+            payload_type,
+            payload_bytes,
+            port=port,
+            timestamp=timestamp,
+            extended_length=extended_length,
         )
         self._payload: P | _UNDECODED = _UNDECODED
 
@@ -82,28 +144,19 @@ class HarpMessage(Generic[P]):
         """Parse and validate a complete Harp Message from a byte sequence. Raises ``HarpParseError`` on failure."""
         raw = data if isinstance(data, bytes) else bytes(data)
 
-        if len(raw) < _MIN_FRAME_LEN:
-            raise HarpParseError(f"Frame too short: {len(raw)} bytes (minimum {_MIN_FRAME_LEN})")
+        if not raw:
+            raise HarpParseError("Frame is empty")
 
-        if not _validate_checksum(raw):
-            raise HarpParseError("Checksum mismatch")
-
-        # Validate MessageType byte (bits 7,6,5,4,2 must be 0; bits 1:0 are type)
+        # Validate MessageType byte (bits 7,6,5,2 must be 0; bits 1:0 are type). It is
+        # read first, since its extended-length bit decides how the rest is framed.
         b0 = raw[0]
         if _message_type_from_byte_safe(b0) is None:
             raise HarpParseError(f"Invalid MessageType byte: 0x{b0:02x}")
 
-        length = raw[1]
-        if len(raw) != length + 2:
-            raise HarpParseError(f"Length field {length} inconsistent with buffer size {len(raw)}")
-
-        try:
-            decode_payload_type(raw[4])
-        except ValueError as exc:
-            raise HarpParseError(str(exc)) from exc
-
-        if bool(raw[4] & _TIMESTAMP_FLAG) and len(raw) < _HEADER_LEN + _TIMESTAMP_LEN + 1:
-            raise HarpParseError("Frame too short to contain timestamp")
+        if b0 & _EXTENDED_LENGTH_FLAG:
+            _validate_extended_frame(raw)
+        else:
+            _validate_regular_frame(raw)
 
         obj = cls.__new__(cls)
         obj._bytes = raw
@@ -121,38 +174,76 @@ class HarpMessage(Generic[P]):
         return bool(self._bytes[0] & 0x08)
 
     @property
+    def is_extended_length(self) -> bool:
+        """Return True if this message uses extended-length framing.
+
+        An extended-length frame has a U32 length and a CRC-32 checksum, in place of the
+        U8 length and the U8 sum of a regular frame.
+        """
+        return bool(self._bytes[0] & _EXTENDED_LENGTH_FLAG)
+
+    # The fields below sit 3 bytes further into an extended-length frame, whose length
+    # field is a U32 rather than a U8. The flag is tested inline rather than through a
+    # helper, since these are read for every message.
+
+    @property
     def address(self) -> int:
         """Return the address byte of this message."""
-        return self._bytes[2]
+        raw = self._bytes
+        return raw[_EXT_ADDRESS] if raw[0] & _EXTENDED_LENGTH_FLAG else raw[_ADDRESS]
 
     @property
     def port(self) -> int:
         """Return the port byte of this message."""
-        return self._bytes[3]
+        raw = self._bytes
+        return raw[_EXT_ADDRESS + 1] if raw[0] & _EXTENDED_LENGTH_FLAG else raw[_ADDRESS + 1]
 
     @property
     def payload_type(self) -> PayloadType:
         """Return the PayloadType of this message."""
-        return decode_payload_type(self._bytes[4]).payload_type
+        raw = self._bytes
+        pt_byte = raw[_EXT_ADDRESS + 2] if raw[0] & _EXTENDED_LENGTH_FLAG else raw[_ADDRESS + 2]
+        return decode_payload_type(pt_byte).payload_type
 
     @property
     def has_timestamp(self) -> bool:
         """Return True if the timestamp flag is set in this message."""
-        return bool(self._bytes[4] & _TIMESTAMP_FLAG)
+        raw = self._bytes
+        pt_byte = raw[_EXT_ADDRESS + 2] if raw[0] & _EXTENDED_LENGTH_FLAG else raw[_ADDRESS + 2]
+        return bool(pt_byte & _TIMESTAMP_FLAG)
 
     @property
     def timestamp(self) -> float | None:
         """Return the timestamp of this message, or None if not present."""
-        if not self.has_timestamp:
+        raw = self._bytes
+        offset = _EXTENDED_HEADER_LEN if raw[0] & _EXTENDED_LENGTH_FLAG else _HEADER_LEN
+        if not raw[offset - 1] & _TIMESTAMP_FLAG:
             return None
-        seconds, microseconds = struct.unpack_from("<IH", self._bytes, _HEADER_LEN)
+        seconds, microseconds = struct.unpack_from("<IH", raw, offset)
         return cast(int, seconds) + cast(int, microseconds) * _TICK_PERIOD_S
 
     @property
     def payload_bytes(self) -> memoryview:
         """Payload bytes, excluding timestamp and checksum."""
-        offset = _TIMESTAMPED_PAYLOAD_OFFSET if self.has_timestamp else _HEADER_LEN
-        return memoryview(self._bytes)[offset:-1]
+        raw = self._bytes
+        if raw[0] & _EXTENDED_LENGTH_FLAG:
+            offset, end = _EXTENDED_HEADER_LEN, -_CRC_LEN
+        else:
+            offset, end = _HEADER_LEN, -_CHECKSUM_LEN
+        if raw[offset - 1] & _TIMESTAMP_FLAG:
+            offset += _TIMESTAMP_LEN
+        return memoryview(raw)[offset:end]
+
+    @property
+    def checksum(self) -> int:
+        """Return the checksum field of this message.
+
+        That is the U8 sum of a regular frame, or the CRC-32 of an extended-length one.
+        """
+        raw = self._bytes
+        if raw[0] & _EXTENDED_LENGTH_FLAG:
+            return int.from_bytes(raw[-_CRC_LEN:], "little")
+        return raw[-1]
 
     @property
     def has_payload(self) -> bool:
@@ -187,12 +278,21 @@ class HarpMessage(Generic[P]):
                 f"{decoder.__name__} declares {decoder.payload_type!r} but this "
                 f"message declares {self.payload_type!r}."
             )
-        expected = decoder.payload_class.payload_dtype.itemsize
+        payload_class = decoder.payload_class
         actual = len(self.payload_bytes)
-        if actual != expected:
+        # The fixed case is compared inline, since every reply and event is decoded.
+        if payload_class._max_length is None:
+            accepted = actual == payload_class.payload_dtype.itemsize
+        else:
+            accepted = payload_class._accepts_payload_size(actual)
+        if not accepted:
+            itemsize = payload_class.payload_dtype.itemsize
+            if payload_class._max_length is None:
+                expected = f"{itemsize} payload bytes"
+            else:
+                expected = f"up to {payload_class._max_length} elements of {itemsize} payload bytes"
             raise HarpParseError(
-                f"{decoder.__name__} reads {expected} payload bytes but this message "
-                f"carries {actual}."
+                f"{decoder.__name__} reads {expected} but this message carries {actual}."
             )
         obj: HarpMessage[_P] = HarpMessage.__new__(HarpMessage)
         obj._bytes = self._bytes

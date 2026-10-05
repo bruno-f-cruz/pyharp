@@ -24,7 +24,7 @@ def test_from_byte_valid(byte, expected_type, expected_error):
     [
         0x00,  # type bits = 0, invalid
         0x04,  # type bits = 0 (bit 2 set, reserved)
-        0x10,  # reserved bit 4
+        0x10,  # type bits = 0 (bit 4 is extended length, not a type)
         0x20,  # reserved bit 5
         0x40,  # reserved bit 6
         0x80,  # reserved bit 7

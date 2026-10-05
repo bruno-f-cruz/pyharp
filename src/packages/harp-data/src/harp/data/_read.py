@@ -26,6 +26,7 @@ from harp.protocol import (
     decode_payload_type,
 )
 from harp.protocol._constants import _HEADER_LEN, _TIMESTAMP_LEN
+from harp.protocol._message_type import is_extended_length
 
 from ._reader import Source, _read_bytes, parse_to_dataframe
 
@@ -63,6 +64,8 @@ def _infer_native_register(raw: bytes) -> type[RegisterBase[Any]]:
     """
     if len(raw) < _HEADER_LEN:
         raise ValueError(f"buffer too short to contain a Harp frame header ({len(raw)} bytes)")
+    if is_extended_length(raw[0]):
+        raise NotImplementedError("Reading extended-length frames is not supported yet.")
     info = decode_payload_type(raw[4])
     stride = int(raw[1]) + 2
     payload_offset = _HEADER_LEN + (_TIMESTAMP_LEN if info.has_timestamp else 0)
