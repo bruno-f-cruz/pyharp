@@ -60,6 +60,7 @@ def open_device(
     port: str,
     baudrate: int = ...,
     raise_on_error: bool = ...,
+    max_frame_length: int | None = ...,
 ) -> D: ...
 
 
@@ -70,6 +71,7 @@ def open_device(
     port: str,
     baudrate: int = ...,
     raise_on_error: bool = ...,
+    max_frame_length: int | None = ...,
 ) -> Device[M]: ...
 
 
@@ -80,6 +82,7 @@ def open_device(
     port: str,
     baudrate: int = ...,
     raise_on_error: bool = ...,
+    max_frame_length: int | None = ...,
 ) -> Device[None]: ...
 
 
@@ -89,6 +92,7 @@ def open_device(
     port: str,
     baudrate: int = DEFAULT_BAUDRATE,
     raise_on_error: bool = True,
+    max_frame_length: int | None = None,
 ) -> Device:
     """Build a :class:`~harp.device.client.Device` over a serial transport and open it.
 
@@ -111,8 +115,18 @@ def open_device(
 
     Like the builtin :func:`open`, the returned device is already connected; use it
     directly or in a ``with`` block for guaranteed close.
+
+    ``raise_on_error`` and ``max_frame_length`` are passed to the device, as described
+    on :class:`~harp.device.client.Device`.
     """
     transport = SerialTransport(port, baudrate)
     if isinstance(device_or_module, type):
-        return device_or_module(transport, raise_on_error=raise_on_error).open()
-    return Device(transport, device_or_module, raise_on_error=raise_on_error).open()
+        return device_or_module(
+            transport, raise_on_error=raise_on_error, max_frame_length=max_frame_length
+        ).open()
+    return Device(
+        transport,
+        device_or_module,
+        raise_on_error=raise_on_error,
+        max_frame_length=max_frame_length,
+    ).open()
